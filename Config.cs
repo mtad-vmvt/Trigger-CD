@@ -27,7 +27,7 @@ public class Config {
 		var lst = new List<CfgApp>();
 		App.Configuration.GetSection("Apps").Bind(lst);
 		if(lst is not null){
-			var ret = new Dictionary<string,CfgApp>();
+			var ret = new Dictionary<string,CfgApp>(StringComparer.OrdinalIgnoreCase);
 			foreach (var i in lst) {
 				if (i.Name is not null) {
 					ret[i.Name.ToLower()] = i;
@@ -72,6 +72,9 @@ public class CfgApp{
 	public string? ChOwn { get; set; }
 	public string? ChMod { get; set; }
 	public string? Service { get; set; }
+	public string? HealthCheckUrl { get; set; }
+	public int HealthCheckTimeoutSeconds { get; set; } = 60;
+	public int HealthCheckIntervalMilliseconds { get; set; } = 1000;
 	public bool? Clean { get; set; }
 	public List<string> SkipClean { get; set; } = ["appsettings.json"];
 	public string? Script { get; set; }

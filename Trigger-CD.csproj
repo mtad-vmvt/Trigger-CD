@@ -15,6 +15,8 @@
 		<Compile Remove="data\**" />
 		<Content Remove="Release\**" />
 		<Compile Remove="Release\**" />
+		<Content Remove="Trigger-CD.Tests\**" />
+		<Compile Remove="Trigger-CD.Tests\**" />
 	</ItemGroup>
 
 </Project>

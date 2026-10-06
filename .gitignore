@@ -1,6 +1,9 @@
 /bin
 /data
 /obj
+**/bin/
+**/obj/
+/publish/
 /secrets.json
 /.config
 /.vs

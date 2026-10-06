@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore
+        run: dotnet restore Trigger-CD.sln --disable-parallel
+      - name: Build
+        run: dotnet build Trigger-CD.sln --configuration Release --no-restore -m:1
+      - name: Test deployment completion
+        run: dotnet test Trigger-CD.Tests/Trigger-CD.Tests.csproj --configuration Release --no-build --no-restore
+      - name: Publish Linux deployment service
+        run: dotnet publish Trigger-CD.csproj --configuration Release -r linux-x64 --self-contained true -p:PublishSingleFile=true --output ./publish
+      - uses: actions/upload-artifact@v6
+        with:
+          name: trigger-cd-linux-x64
+          path: ./publish/
