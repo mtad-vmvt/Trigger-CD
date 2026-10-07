@@ -16,12 +16,12 @@ public static class Files {
 				string relativePath = GetRelative(subDir, root);
 				if (except != null && except.Contains(relativePath)) continue;
 				if (recursive) CleanDir(subDir, true, log, except, root);
-				if (Directory.GetFiles(subDir, "*", SearchOption.AllDirectories).Length == 0) {
-					try { Directory.Delete(subDir, false); } catch { }
+				if (Directory.GetFileSystemEntries(subDir).Length == 0) {
+					Directory.Delete(subDir, false);
 				}
 			}
 		}
-		catch (Exception ex) { log.Print("Error", new { Error = "CleanDir", ex.Message }); }
+		catch (Exception ex) { log.Print("Error", new { Error = "CleanDir", ex.Message }); throw; }
 	}
 
 	public static string GetRelative(string path, string root) => Path.GetRelativePath(root, path).Replace('\\', '/');

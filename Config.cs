@@ -30,6 +30,10 @@ public class Config {
 			var ret = new Dictionary<string,CfgApp>();
 			foreach (var i in lst) {
 				if (i.Name is not null) {
+					if (AppsCache.TryGetValue(i.Name.ToLower(), out var active) && (active.Running > DateTime.UtcNow || active.Lock > DateTime.UtcNow)) {
+						ret[i.Name.ToLower()] = active;
+						continue;
+					}
 					ret[i.Name.ToLower()] = i;
 					if (i.Repo is not null) {
 						i.Repo.App ??= i.Name;
@@ -72,6 +76,9 @@ public class CfgApp{
 	public string? ChOwn { get; set; }
 	public string? ChMod { get; set; }
 	public string? Service { get; set; }
+	public string? HealthCheckUrl { get; set; }
+	public int HealthCheckTimeoutSeconds { get; set; } = 60;
+	public int HealthCheckIntervalMilliseconds { get; set; } = 1000;
 	public bool? Clean { get; set; }
 	public List<string> SkipClean { get; set; } = ["appsettings.json"];
 	public string? Script { get; set; }

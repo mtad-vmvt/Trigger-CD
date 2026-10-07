@@ -11,6 +11,7 @@ public class GitHub {
 	public string? Repo { get; set; }
 	public string? Name { get; set; }
 	public string? Token { get; set; }
+	public GHArtifact? PendingArtifact { get; private set; }
 
 	static GitHub() {
 		HClient = new HttpClient(new HttpClientHandler() { AllowAutoRedirect = true });
@@ -18,23 +19,29 @@ public class GitHub {
 	}
 
 
-	public async Task<bool> Download(string path, Log log, bool force = false, int retry = 0, bool debug=true) {
+	public async Task<bool> Download(string path, Log log, bool force = false, int retry = 0, bool debug=true, long? artifactId=null) {
+		PendingArtifact = null;
 		if (Repo is not null && Name is not null && App is not null) {
-			using var req = new HttpRequestMessage(HttpMethod.Get, $"https://api.github.com/repos/{Org}/{Repo}/actions/artifacts?name={Name}&per_page=1");
+			var address = artifactId.HasValue
+				? $"https://api.github.com/repos/{Org}/{Repo}/actions/artifacts/{artifactId.Value}"
+				: $"https://api.github.com/repos/{Org}/{Repo}/actions/artifacts?name={Uri.EscapeDataString(Name)}&per_page=1";
+			using var req = new HttpRequestMessage(HttpMethod.Get, address);
 			if (Token is not null) req.Headers.Authorization = new("token", Token);
 
 			try {
-				if (debug) log.Print("Debug",$"Git - Url https://api.github.com/repos/{Org}/{Repo}/actions/artifacts?name={Name}&per_page=1");
+				if (debug) log.Print("Debug",$"Git - Url {address}");
 				using var response = await HClient.SendAsync(req);
 				if (debug) log.Print("Debug", $"Git - Status {response.StatusCode}");
 				if (response.IsSuccessStatusCode) {
-					var dta = await response.Content.ReadFromJsonAsync<GHArtifacts>();
+					var dta = artifactId.HasValue ? null : await response.Content.ReadFromJsonAsync<GHArtifacts>();
 					if (debug) log.Print("Debug", $"Git - Artifacts {JsonSerializer.Serialize(dta)}");
-					var af = dta?.Artifacts?.FirstOrDefault();
+					var af = artifactId.HasValue ? await response.Content.ReadFromJsonAsync<GHArtifact>() : dta?.Artifacts?.FirstOrDefault();
 					if (af is not null) {
+						if (af.Expired || af.Name != Name || (artifactId.HasValue && af.Id != artifactId.Value))
+							throw new InvalidOperationException("Deployment artifact does not match the request or has expired.");
 						var vrs = Version.Get(App);
 						vrs.Log ??= [];
-						if (force || vrs.Id < af.Id) {
+						if (artifactId.HasValue || force || vrs.Id < af.Id) {
 							if (debug) log.Print("Debug", $"Git - Download {af.Download}");
 							using var dlr = new HttpRequestMessage(HttpMethod.Get, af.Download);
 							if (Token is not null) dlr.Headers.Authorization = new("token", Token);
@@ -47,27 +54,26 @@ public class GitHub {
 									using (var dls = new FileStream(pth, FileMode.Create)) await flr.Content.CopyToAsync(dls);
 
 									log.Print("Release", $"{af.Id} ({af.Size_in_bytes / 1024:0.##}KB){(force ? " (force)" : "")}");
-									vrs.Id = af.Id; vrs.Date = af.Created_at; vrs.Url = af.Download;
-									vrs.Log.Add($"{af.Created_at:yyyy-MM-ddTHH:mm:ssZ}|{af.Id}|{af.Size_in_bytes}");
-									vrs.Save();
+									PendingArtifact = af;
 									return true;
 
 								} catch (Exception ex) {
-									log.Print("GitError", new { Error = "Archive", ex.Message, ex.StackTrace });
+									log.Print("GitError", new { Error = "Archive", ex.Message, ex.StackTrace }); throw;
 								}
 
 							}
 							else {
 								var rsp = "";
 								try { rsp = await flr.Content.ReadAsStringAsync(); } catch (Exception) { }
-								log.Print("GitError", new { Error = "Download", Status = response.StatusCode, Code = (int)response.StatusCode, Response = rsp });
+								log.Print("GitError", new { Error = "Download", Status = flr.StatusCode, Code = (int)flr.StatusCode, Response = rsp });
+							throw new InvalidOperationException("Deployment artifact download failed.");
 							}
 						}
 						else {
 							if (retry > 0) {
 								log.Print("Git", $"Waiting ({retry})");
 								Thread.Sleep(1000); retry--;
-								return await Download(path, log, force, retry, debug);
+								return await Download(path, log, force, retry, debug, artifactId);
 							}
 							else {
 								log.Print("Git", $"No new artifacts ({vrs.Id})");
@@ -77,19 +83,19 @@ public class GitHub {
 							}
 						}
 					}
-					else log.Print("GitError", new { Error = "No artifacts", Response = JsonSerializer.Serialize(dta) });
+					else throw new InvalidOperationException("No deployment artifact was found.");
 				}
 				else {
 					var rsp = "";
 					try { rsp = await response.Content.ReadAsStringAsync(); } catch (Exception) { }
 					log.Print("GitError", new { Error = "Request", Status = response.StatusCode, Code = (int)response.StatusCode, Response = rsp });
+					throw new InvalidOperationException("Deployment artifact metadata request failed.");
 				}
 			} catch (Exception ex) {
-				log.Print("GitError", new { Error = "General", ex.Message, ex.StackTrace });
+				log.Print("GitError", new { Error = "General", ex.Message, ex.StackTrace }); throw;
 			}
 		}
-		else log.Print("GitError", new { Error = "Config", Path = path, Data = JsonSerializer.Serialize(this) });
-		return false;
+		else throw new InvalidOperationException("GitHub deployment configuration is incomplete.");
 	}
 
 }
