@@ -6,7 +6,6 @@ var app = builder.Build();
 
 var cfg = new Config(app);
 Directory.CreateDirectory("data/files");
-var deployments = new DeploymentManager(new DeploymentRunner(), app.Lifetime.ApplicationStopping);
-DeploymentEndpoints.Map(app, cfg, deployments);
+DeploymentEndpoints.Map(app, cfg, new DeploymentRunner());
 
 app.Run();

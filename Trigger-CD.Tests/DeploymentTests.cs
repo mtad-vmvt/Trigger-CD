@@ -64,7 +64,7 @@ public class DeploymentTests {
 	}
 
 	[TestMethod]
-	public async Task UnhealthyApiRemainsPendingThenFailsWithoutRecordingVersion() {
+	public async Task UnhealthyApiFailsWithoutRecordingVersion() {
 		var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		using var health = new HttpClient(new Handler(_ => {
 			entered.TrySetResult();
@@ -72,19 +72,18 @@ public class DeploymentTests {
 		}));
 		var app = CreateApp();
 		app.HealthCheckTimeoutSeconds = 1;
-		var manager = new DeploymentManager(new DeploymentRunner(health, (_, _, _) => true));
-		var job = manager.Start(app, 44, false, 0, 0, 0, out _)!;
+		var deployment = new DeploymentRunner(health, (_, _, _) => true).Run(app, 44, false, 0, 0, default);
 		await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.AreEqual("pending", job.Status.Status);
+		Assert.IsFalse(deployment.IsCompleted);
 		Assert.IsFalse(File.Exists("data/api.json"));
-		await job.Completion.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.AreEqual("failed", job.Status.Status);
-		Assert.AreEqual("Application did not become ready before the health check deadline.", job.Status.Message);
+		var result = await deployment.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.IsFalse(result.Succeeded);
+		Assert.AreEqual("Application did not become ready before the health check deadline.", result.Message);
 		Assert.IsFalse(File.Exists("data/api.json"));
 	}
 
 	[TestMethod]
-	public async Task SuccessIsPublishedAndVersionRecordedOnlyAfterApiIsReady() {
+	public async Task SuccessAndVersionRecordingWaitForApiReadiness() {
 		var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		var attempts = 0;
@@ -94,16 +93,14 @@ public class DeploymentTests {
 			await ready.Task;
 			return new HttpResponseMessage(HttpStatusCode.OK);
 		}));
-		var manager = new DeploymentManager(new DeploymentRunner(health, (_, _, _) => true));
 		var app = CreateApp();
-		var job = manager.Start(app, 44, false, 0, 0, 0, out _)!;
+		var deployment = new DeploymentRunner(health, (_, _, _) => true).Run(app, 44, false, 0, 0, default);
 		await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.AreEqual("pending", job.Status.Status);
+		Assert.IsFalse(deployment.IsCompleted);
 		Assert.IsFalse(File.Exists("data/api.json"));
 		Assert.AreEqual("deployed", File.ReadAllText(Path.Combine(app.Path!, "application.txt")));
 		ready.SetResult();
-		await job.Completion.WaitAsync(TimeSpan.FromSeconds(5));
-		Assert.AreEqual("succeeded", job.Status.Status);
+		Assert.IsTrue((await deployment.WaitAsync(TimeSpan.FromSeconds(5))).Succeeded);
 		Assert.AreEqual(44L, App.Version.Get("api").Id);
 		Assert.AreEqual(2, attempts);
 	}
@@ -139,54 +136,108 @@ public class DeploymentTests {
 	}
 
 	[TestMethod]
-	public async Task StatusIsAuthenticatedAppScopedAndUnknownJobsFail() {
+	public async Task ExactArtifactRequestWaitsThenReturnsTheCompletionMarker() {
 		var runner = new PendingRunner();
-		var manager = new DeploymentManager(runner);
-		var (server, client) = await StartApi(manager);
+		var (server, client, _) = await StartApi(runner);
 		await using var serverLifetime = server;
 		using var clientLifetime = client;
-		var start = await client.GetAsync("/api/key?operation=start&artifactId=44");
-		Assert.AreEqual(HttpStatusCode.Accepted, start.StatusCode);
-		var pending = await start.Content.ReadFromJsonAsync<DeploymentStatus>();
-		Assert.AreEqual("pending", pending!.Status);
+		var request = client.GetAsync("/api/key?artifactId=44");
 		await runner.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.IsFalse(request.IsCompleted);
 		Assert.AreEqual(44L, runner.ArtifactId);
-		var query = $"?operation=status&deploymentId={pending.DeploymentId}";
-		Assert.AreEqual(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/wrong" + query)).StatusCode);
-		Assert.AreEqual(HttpStatusCode.NotFound, (await client.GetAsync("/other/key" + query)).StatusCode);
-		Assert.AreEqual(HttpStatusCode.NotFound, (await client.GetAsync($"/api/key?operation=status&deploymentId={Guid.NewGuid()}")).StatusCode);
-		Assert.AreEqual(HttpStatusCode.Conflict, (await client.GetAsync("/api/key?operation=start&artifactId=45")).StatusCode);
-		runner.Finish.SetResult(new(false, "Service start failed."));
-		await manager.Find("api", pending.DeploymentId)!.Completion;
-		var failed = await client.GetFromJsonAsync<DeploymentStatus>("/api/key" + query);
-		Assert.AreEqual("failed", failed!.Status);
-		Assert.AreEqual("Service start failed.", failed.Message);
+		runner.Finish.SetResult(new(true));
+		var response = await request.WaitAsync(TimeSpan.FromSeconds(5));
+		Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+		Assert.AreEqual("Deployed:44", await response.Content.ReadAsStringAsync());
 	}
 
 	[TestMethod]
-	public async Task LegacyRequestWaitsForCompletionAndReportsFailure() {
+	public async Task FailedDeploymentReturnsHttp500WithoutASuccessMarker() {
 		var runner = new PendingRunner();
-		var (server, client) = await StartApi(new DeploymentManager(runner));
+		var (server, client, _) = await StartApi(runner);
+		await using var serverLifetime = server;
+		using var clientLifetime = client;
+		var request = client.GetAsync("/api/key?artifactId=44");
+		await runner.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+		runner.Finish.SetResult(new(false, "Service start failed."));
+		var response = await request;
+		Assert.AreEqual(HttpStatusCode.InternalServerError, response.StatusCode);
+		StringAssert.Contains(await response.Content.ReadAsStringAsync(), "Service start failed.");
+	}
+
+	[TestMethod]
+	public async Task LegacyRequestWaitsThenReturnsOk() {
+		var runner = new PendingRunner();
+		var (server, client, _) = await StartApi(runner, health: false);
 		await using var serverLifetime = server;
 		using var clientLifetime = client;
 		var request = client.GetAsync("/api/key");
 		await runner.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 		Assert.IsFalse(request.IsCompleted);
-		runner.Finish.SetResult(new(false, "Readiness check failed."));
+		Assert.IsNull(runner.ArtifactId);
+		runner.Finish.SetResult(new(true));
 		var response = await request;
-		Assert.AreEqual(HttpStatusCode.InternalServerError, response.StatusCode);
-		StringAssert.Contains(await response.Content.ReadAsStringAsync(), "Readiness check failed.");
+		Assert.AreEqual(HttpStatusCode.OK, response.StatusCode);
+		Assert.AreEqual("Ok", await response.Content.ReadAsStringAsync());
 	}
 
 	[TestMethod]
-	public async Task VerifiedServiceRequiresHealthConfigurationAndArtifactId() {
+	public async Task AuthenticationAndOverlapChecksSurviveConfigurationReload() {
 		var runner = new PendingRunner();
-		var (server, client) = await StartApi(new DeploymentManager(runner), false);
+		var (server, client, cfg) = await StartApi(runner);
 		await using var serverLifetime = server;
 		using var clientLifetime = client;
-		Assert.AreEqual(HttpStatusCode.BadRequest, (await client.GetAsync("/api/key?operation=start&artifactId=44")).StatusCode);
-		Assert.AreEqual(HttpStatusCode.BadRequest, (await client.GetAsync("/api/key?operation=start")).StatusCode);
-		Assert.AreEqual(HttpStatusCode.BadRequest, (await client.GetAsync("/api/key?operation=start&artifactId=0")).StatusCode);
+		Assert.AreEqual(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/wrong?artifactId=44")).StatusCode);
+		Assert.AreEqual(HttpStatusCode.NotFound, (await client.GetAsync("/missing/key?artifactId=44")).StatusCode);
+		var first = client.GetAsync("/api/key?artifactId=44");
+		await runner.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+		cfg.Reload();
+		var overlapping = await client.GetAsync("/API/key?artifactId=45");
+		Assert.AreEqual(HttpStatusCode.Conflict, overlapping.StatusCode);
+		StringAssert.Contains(await overlapping.Content.ReadAsStringAsync(), "Running");
+		Assert.AreEqual(1, runner.Calls);
+		runner.Finish.SetResult(new(true));
+		Assert.AreEqual("Deployed:44", await (await first).Content.ReadAsStringAsync());
+	}
+
+	[TestMethod]
+	public async Task CooldownSurvivesConfigurationReload() {
+		var runner = new PendingRunner();
+		runner.Finish.SetResult(new(true));
+		var (server, client, cfg) = await StartApi(runner, lockSeconds: 30);
+		await using var serverLifetime = server;
+		using var clientLifetime = client;
+		Assert.AreEqual(HttpStatusCode.OK, (await client.GetAsync("/api/key?artifactId=44")).StatusCode);
+		cfg.Reload();
+		var blocked = await client.GetAsync("/api/key?artifactId=45");
+		Assert.AreEqual(HttpStatusCode.Conflict, blocked.StatusCode);
+		StringAssert.Contains(await blocked.Content.ReadAsStringAsync(), "Locked");
+		Assert.AreEqual(1, runner.Calls);
+	}
+
+	[TestMethod]
+	public async Task ExactServiceDeploymentRequiresHealthConfiguration() {
+		var runner = new PendingRunner();
+		var (server, client, _) = await StartApi(runner, health: false);
+		await using var serverLifetime = server;
+		using var clientLifetime = client;
+		Assert.AreEqual(HttpStatusCode.BadRequest, (await client.GetAsync("/api/key?artifactId=44")).StatusCode);
+		Assert.IsFalse(runner.Entered.Task.IsCompleted);
+	}
+
+	[TestMethod]
+	[DataRow("artifactId=0")]
+	[DataRow("artifactId=-1")]
+	[DataRow("artifactId=invalid")]
+	[DataRow("artifactId=")]
+	[DataRow("operation=start&artifactId=44")]
+	[DataRow("operation=status&deploymentId=b1b1fb08-6b6c-440c-8c4c-8c92b1d83bf9")]
+	public async Task InvalidArtifactAndObsoleteOperationsDoNotDeploy(string query) {
+		var runner = new PendingRunner();
+		var (server, client, _) = await StartApi(runner);
+		await using var serverLifetime = server;
+		using var clientLifetime = client;
+		Assert.AreEqual(HttpStatusCode.BadRequest, (await client.GetAsync("/api/key?" + query)).StatusCode);
 		Assert.IsFalse(runner.Entered.Task.IsCompleted);
 	}
 
@@ -194,12 +245,12 @@ public class DeploymentTests {
 	[DataRow(null)]
 	[DataRow("")]
 	[DataRow(" ")]
-	public async Task MissingConfiguredKeyRejectsStartStatusAndLegacyRequests(string? appKey) {
+	public async Task MissingConfiguredKeyRejectsRequests(string? appKey) {
 		var runner = new PendingRunner();
-		var (server, client) = await StartApi(new DeploymentManager(runner), appKey: appKey);
+		var (server, client, _) = await StartApi(runner, appKey: appKey);
 		await using var serverLifetime = server;
 		using var clientLifetime = client;
-		foreach (var query in new[] { "", "?operation=start&artifactId=44", $"?operation=status&deploymentId={Guid.NewGuid()}" }) {
+		foreach (var query in new[] { "", "?artifactId=44" }) {
 			var response = await client.GetAsync("/api" + query);
 			Assert.AreEqual(HttpStatusCode.BadRequest, response.StatusCode);
 			StringAssert.Contains(await response.Content.ReadAsStringAsync(), "authentication key is not configured");
@@ -259,21 +310,21 @@ public class DeploymentTests {
 		};
 	}
 
-	private async Task<(WebApplication, HttpClient)> StartApi(DeploymentManager manager, bool health = true, string? appKey = "key") {
+	private async Task<(WebApplication, HttpClient, Config)> StartApi(IDeploymentRunner runner, bool health = true, string? appKey = "key", int lockSeconds = 0) {
 		var builder = WebApplication.CreateBuilder(new WebApplicationOptions { ContentRootPath = _directory, EnvironmentName = "Testing" });
 		builder.WebHost.UseUrls("http://127.0.0.1:0");
 		builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?> {
-			["Lock"] = "0", ["Delay"] = "0", ["WaitTime"] = "0",
+			["Lock"] = lockSeconds.ToString(), ["Delay"] = "0", ["WaitTime"] = "0",
 			["Apps:0:Name"] = "api", ["Apps:0:Key"] = appKey, ["Apps:0:Path"] = _directory,
 			["Apps:0:Service"] = "web_okis_dev", ["Apps:0:Repo:App"] = "api",
-			["Apps:0:HealthCheckUrl"] = health ? "http://127.0.0.1:5000/api/health" : null,
-			["Apps:1:Name"] = "other", ["Apps:1:Key"] = "key"
+			["Apps:0:HealthCheckUrl"] = health ? "http://127.0.0.1:5000/api/health" : null
 		});
 		var server = builder.Build();
-		DeploymentEndpoints.Map(server, new Config(server), manager);
+		var cfg = new Config(server);
+		DeploymentEndpoints.Map(server, cfg, runner);
 		await server.StartAsync();
 		var address = server.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
-		return (server, new HttpClient { BaseAddress = new Uri(address) });
+		return (server, new HttpClient { BaseAddress = new Uri(address) }, cfg);
 	}
 
 	private class Handler(Func<HttpRequestMessage, Task<HttpResponseMessage>> handle) : HttpMessageHandler {
@@ -281,10 +332,13 @@ public class DeploymentTests {
 	}
 
 	private class PendingRunner : IDeploymentRunner {
+		private int _calls;
+		public int Calls => _calls;
 		public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 		public TaskCompletionSource<DeploymentResult> Finish { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 		public long? ArtifactId { get; private set; }
 		public Task<DeploymentResult> Run(CfgApp app, long? artifactId, bool force, int waitTime, int delay, CancellationToken cancellationToken) {
+			Interlocked.Increment(ref _calls);
 			ArtifactId = artifactId;
 			Entered.TrySetResult();
 			return Finish.Task;

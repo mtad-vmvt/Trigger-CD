@@ -4,6 +4,11 @@ using System.Net;
 namespace App;
 
 public class DeploymentException(string message) : Exception(message);
+public record DeploymentResult(bool Succeeded, string? Message = null);
+
+public interface IDeploymentRunner {
+	Task<DeploymentResult> Run(CfgApp app, long? artifactId, bool force, int waitTime, int delay, CancellationToken cancellationToken);
+}
 
 public class DeploymentRunner : IDeploymentRunner {
 	private readonly HttpClient _health;
